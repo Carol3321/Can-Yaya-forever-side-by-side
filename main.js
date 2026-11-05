@@ -49,10 +49,9 @@ async function init() {
   // 缩略图优先，模型最多等 12 秒再开始下。
   const galleryDone = loadGallery();
   setTimeout(() => startModelLoad().catch((err) => console.warn('模型预热失败:', err)), 12000);
-  // 相册一到位就同时开始：模型下载 + 全部原图后台预下载
+  // 相册一到位就开始下模型。原图不预下载：默认展示高清优化图，原图只在按 O 时单独取
   galleryDone.finally(() => {
     startModelLoad().catch((err) => console.warn('模型预热失败:', err));
-    setTimeout(startOriginalPrefetch, 3000);
   });
 
   // 第二次打开时模型/缩略图直接走缓存
@@ -515,6 +514,8 @@ function loadFullTexture(p) {
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const tex = await fullLoader.loadAsync(url);
+      // 显式解码：把解码放在下载阶段完成，换贴图那一帧就不会卡动画
+      try { if (tex.image && tex.image.decode) await tex.image.decode(); } catch (e) {}
       URL.revokeObjectURL(url);
       tex.colorSpace = THREE.SRGBColorSpace;
       tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
@@ -562,7 +563,8 @@ function loadMidTexture(p) {
   p.midPromise = new Promise((resolve) => {
     fullLoader.load(
       p.midUrl,
-      (tex) => {
+      async (tex) => {
+        try { if (tex.image && tex.image.decode) await tex.image.decode(); } catch (e) {}
         tex.colorSpace = THREE.SRGBColorSpace;
         tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
         p.midTexture = tex;
@@ -612,43 +614,39 @@ function refitPhotoGeometry(p, tex) {
   p.frameH = ph + 0.2;
 }
 
-/** 某张照片成为特写时：先上 720px，再换 1800px（并预取后面几张） */
+/**
+ * 某张照片成为特写时：先用中图秒出画面，再换 1920px 高清图。
+ * 默认不碰原图（单张最大 20MB）；要看原图按 O，见 loadOriginalTexture。
+ */
 function ensureFullTexture(mesh) {
   if (!mesh) return;
   const p = particleSystem.find(x => x.mesh === mesh);
   if (!p) return;
 
-  // 三级递进：720 先出画面 -> 1350 变清楚 -> 原图最高画质
-  if (p.origTexture) {
-    applyTextureToParticle(p, p.origTexture);
-  } else if (p.fullTexture) {
+  if (p.fullTexture) {
     applyTextureToParticle(p, p.fullTexture);
-    loadOriginalTexture(p);
   } else {
+    // 中图几十到一百多 KB，先用它把画面填上，避免空白等待
     loadMidTexture(p).then((mid) => {
-      if (mid && !p.fullTexture && !p.origTexture) applyTextureToParticle(p, mid);
+      if (mid && !p.fullTexture) applyTextureToParticle(p, mid);
     });
-    // 原图和大图并行：之前是等大图下完才开始下载原图，
-    // 慢网下大图又排在 100 张缩略图后面，结果永远等不到
-    loadOriginalTexture(p);
     loadFullTexture(p).then((tex) => {
-      if (!tex) return;
-      if (!p.origTexture) applyTextureToParticle(p, tex);
+      if (!tex) return;                                   // 高清图失败就留在中图上，画面不会空
+      if (STATE.focusTarget === p.mesh) applyTextureToParticle(p, tex);
       if (p.midTexture) { p.midTexture.dispose(); p.midTexture = null; }
+      prefetchNeighbour(p);                               // 当前这张好了，才去准备下一张
     });
   }
+  if (p.fullTexture) prefetchNeighbour(p);
+}
 
-  // 预取：后面两张的大图 + 四张的中间版本
+/** 只预取下一张高清图（并发 1），保证切换时已经解码好 */
+function prefetchNeighbour(p) {
   const list = photoList();
-  const i = list.findIndex(x => x.mesh === mesh);
-  if (i >= 0) {
-    for (let k = 1; k <= 4; k++) {
-      const q = list[(i + k) % list.length];
-      if (!q || q === p) continue;
-      loadMidTexture(q);
-      if (k <= 2) loadFullTexture(q);
-    }
-  }
+  const i = list.findIndex(x => x.mesh === p.mesh);
+  if (i < 0) return;
+  const next = list[(i + 1) % list.length];
+  if (next && next !== p && !next.fullTexture && !next.fullPromise) loadFullTexture(next);
 }
 
 /**
@@ -792,41 +790,6 @@ async function initMediaPipe() {
     });
 }
 
-/**
- * 按顺序把 100 张原图拉下来塞进缓存。慢，但只需要一次；
- * 下完以后点任意一张都是秒出原图。
- */
-let prefetchRunning = false;
-const PREFETCH_BUDGET = 10 * 1024 * 1024;   // 原图单张最大 20MB，只预下前几张，剩下的点开时再取
-async function startOriginalPrefetch() {
-  if (prefetchRunning || !('caches' in window)) return;
-  prefetchRunning = true;
-  const list = photoList();
-  if (!list.some((p) => p.origUrl)) return;   // 没有原图素材就不跑
-  STATE.prefetchTotal = list.length;
-  STATE.prefetchDone = 0;
-  let bytes = 0;
-  for (const p of list) {
-    if (!p.origUrl || bytes > PREFETCH_BUDGET) { STATE.prefetchDone++; continue; }
-    try {
-      const cache = await caches.open('mp-assets-v3');
-      if (!(await cache.match(p.origUrl))) {
-        const res = await fetch(p.origUrl);
-        if (res.ok) {
-          bytes += Number(res.headers.get('content-length')) || 0;
-          await cache.put(p.origUrl, res.clone());
-        }
-      }
-    } catch (e) {
-      // 单张失败不影响整体，下次打开会再试
-    }
-    STATE.prefetchDone++;
-    updateHud(lastPose, true);
-  }
-  prefetchRunning = false;
-  STATE.prefetchDone = STATE.prefetchTotal;
-  updateHud(lastPose, true);
-}
 
 /**
  * 页面一打开就开始拉识别模型（不等摄像头授权），
@@ -1190,10 +1153,6 @@ function updateHud(ev, force = false) {
         : '';
       ui.mode.textContent = `🖼 照片 ${info.index + 1} / ${info.total}${extra} · 捏合或 ↑↓ 翻页`;
       ui.mode.dataset.state = ev.visible ? ev.label : 'NONE';
-    } else if (STATE.prefetchTotal && STATE.prefetchDone < STATE.prefetchTotal) {
-      const pct = Math.round((STATE.prefetchDone / STATE.prefetchTotal) * 100);
-      ui.mode.textContent = `原图预下载 ${STATE.prefetchDone} / ${STATE.prefetchTotal}（${pct}%）· 下完点开就是原图`;
-      ui.mode.dataset.state = 'NONE';
     } else if (ev.visible) {
       ui.mode.textContent = MODE_TEXT[ev.mode] || MODE_TEXT.IDLE;
       ui.mode.dataset.state = ev.label;
@@ -1271,6 +1230,11 @@ function setupEvents() {
       // U 直接回到第一张
       e.preventDefault();
       focusAtIndex(0);
+    } else if (k === 'o') {
+      // O：只看当前这张的原图（默认不下载原图，省流量）
+      e.preventDefault();
+      const p = particleSystem.find(x => x.mesh === STATE.focusTarget);
+      if (p) loadOriginalTexture(p);
     }
   });
 }

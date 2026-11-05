@@ -368,6 +368,8 @@ function addPhotoToScene(texture, fullUrl = null) {
   group.scale.set(s,s,s);
   photoMeshGroup.add(group);
   const particle = new Particle(group, 'PHOTO', false);
+  particle.frameMesh = frame;         // 真图到位后要按真实比例重做几何
+  particle.aspect = aspect;
   particle.frameW = pw + 0.2;         // 相框尺寸，特写时按它算最大可放倍数
   particle.frameH = ph + 0.2;
   particle.fullUrl = fullUrl;         // 树上用缩略图，大图按需加载
@@ -395,12 +397,14 @@ async function loadGallery() {
     // 缩略图陆续到了再换贴图。这样翻页序号和总数从一开始就是固定的，不会跳变。
     const placeholder = createPlaceholderTexture();
     const slots = photos.map((item, index) => {
-      const p = addPhotoToScene(placeholder, `assets/photos/${item.full}`);
+      const p = addPhotoToScene(placeholder, item.full ? `assets/photos/${item.full}` : null);
       p.orderIndex = index;
       p.photoId = item.id;
       p.midUrl = item.mid ? `assets/photos/${item.mid}` : null;
       p.thumbUrl = `assets/photos/${item.thumb}`;
       p.origUrl = item.orig ? `assets/photos/${item.orig}` : null;
+      p.origW = item.w || 0;            // 原图像素尺寸，用来判断是否超过显卡纹理上限
+      p.origH = item.h || 0;
       return p;
     });
 
@@ -500,7 +504,7 @@ const FULL_CACHE_MAX = 8;
 const fullLoader = new THREE.TextureLoader();
 
 function loadFullTexture(p) {
-  if (!p || !p.fullUrl) return Promise.resolve(null);
+  if (!p || !p.fullUrl || p.fullUrl === p.midUrl) return Promise.resolve(null);   // 没单独的大图就直接跳过
   if (p.fullTexture) return Promise.resolve(p.fullTexture);
   if (p.fullPromise) return p.fullPromise;
   // 用 fetch 取字节再交给 TextureLoader：Image 那条路在代理/慢网下会静默失败且没有超时
@@ -576,9 +580,36 @@ function applyTextureToParticle(p, tex) {
   if (!p || !tex) return;
   const plane = p.mesh.userData.photoMesh;
   if (!plane) return;
+  refitPhotoGeometry(p, tex);         // 先按这张图的真实宽高比重建，再换贴图
   if (plane.material.map === tex) return;
   plane.material.map = tex;
   plane.material.needsUpdate = true;
+}
+
+/**
+ * 相册建粒子时用的是 1:1 占位图，几何也是按 1:1 建的。
+ * 真图贴上后必须重建画面和相框，否则每张照片都会被拉成正方形（人像变形）。
+ */
+function refitPhotoGeometry(p, tex) {
+  const img = tex.image;
+  if (!img || !img.width || !img.height) return;
+  const aspect = img.width / img.height;
+  if (p.aspect && Math.abs(aspect - p.aspect) < 0.01) return;   // 比例一致，什么都不用做
+  const LONG = 1.2;                                  // 与 addPhotoToScene 保持一致
+  const pw = aspect >= 1 ? LONG : LONG * aspect;
+  const ph = aspect >= 1 ? LONG / aspect : LONG;
+  const plane = p.mesh.userData.photoMesh;
+  if (plane) {
+    plane.geometry.dispose();
+    plane.geometry = new THREE.PlaneGeometry(pw, ph);
+  }
+  if (p.frameMesh) {
+    p.frameMesh.geometry.dispose();
+    p.frameMesh.geometry = new THREE.BoxGeometry(pw + 0.2, ph + 0.2, 0.05);
+  }
+  p.aspect = aspect;
+  p.frameW = pw + 0.2;
+  p.frameH = ph + 0.2;
 }
 
 /** 某张照片成为特写时：先上 720px，再换 1800px（并预取后面几张） */
@@ -627,6 +658,12 @@ function ensureFullTexture(mesh) {
 const origLoader = new THREE.TextureLoader();
 function loadOriginalTexture(p) {
   if (!p || !p.origUrl || p.origTexture || p.origPromise) return;
+  // 超过显卡纹理上限的原图 WebGL 会直接传不上去（手机上会变黑），这种情况用 mid 顶上
+  const limit = (renderer.capabilities && renderer.capabilities.maxTextureSize) || 4096;
+  if (p.origW && Math.max(p.origW, p.origH) > limit) {
+    console.info(`原图 ${p.origW}×${p.origH} 超过本机纹理上限 ${limit}，改用 mid 版本（屏幕上看不出差别）`);
+    return;
+  }
   p.origPromise = (async () => {
     try {
       const r = await fetch(p.origUrl);
@@ -760,6 +797,7 @@ async function initMediaPipe() {
  * 下完以后点任意一张都是秒出原图。
  */
 let prefetchRunning = false;
+const PREFETCH_BUDGET = 10 * 1024 * 1024;   // 原图单张最大 20MB，只预下前几张，剩下的点开时再取
 async function startOriginalPrefetch() {
   if (prefetchRunning || !('caches' in window)) return;
   prefetchRunning = true;
@@ -767,13 +805,17 @@ async function startOriginalPrefetch() {
   if (!list.some((p) => p.origUrl)) return;   // 没有原图素材就不跑
   STATE.prefetchTotal = list.length;
   STATE.prefetchDone = 0;
+  let bytes = 0;
   for (const p of list) {
-    if (!p.origUrl) { STATE.prefetchDone++; continue; }
+    if (!p.origUrl || bytes > PREFETCH_BUDGET) { STATE.prefetchDone++; continue; }
     try {
-      const cache = await caches.open('mp-assets-v2');
+      const cache = await caches.open('mp-assets-v3');
       if (!(await cache.match(p.origUrl))) {
         const res = await fetch(p.origUrl);
-        if (res.ok) await cache.put(p.origUrl, res.clone());
+        if (res.ok) {
+          bytes += Number(res.headers.get('content-length')) || 0;
+          await cache.put(p.origUrl, res.clone());
+        }
       }
     } catch (e) {
       // 单张失败不影响整体，下次打开会再试

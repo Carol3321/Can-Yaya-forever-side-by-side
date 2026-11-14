@@ -22,6 +22,8 @@ const STATE = {
 
 let scene, camera, renderer, composer;
 let mainGroup;
+let treeStar = null;            // 树顶五角星，每帧转向镜头
+const _starQuat = new THREE.Quaternion();
 let clock = new THREE.Clock();
 let particleSystem = [];
 let photoMeshGroup = new THREE.Group();
@@ -271,6 +273,24 @@ function updateViewMetrics() {
   viewMetrics.w = viewMetrics.h * camera.aspect;
 }
 
+/** 五角星：外顶点半径 outer、内凹半径 inner，挤一点厚度让金属材质有明暗 */
+function createStarGeometry(outer = 1.05, inner = 0.44, depth = 0.26) {
+  const shape = new THREE.Shape();
+  for (let i = 0; i < 10; i++) {
+    const r = i % 2 === 0 ? outer : inner;
+    const a = Math.PI / 2 + (i * Math.PI) / 5;   // 从正上方开始，顶点朝上
+    const x = Math.cos(a) * r;
+    const y = Math.sin(a) * r;
+    if (i === 0) shape.moveTo(x, y); else shape.lineTo(x, y);
+  }
+  shape.closePath();
+  const geo = new THREE.ExtrudeGeometry(shape, {
+    depth, bevelEnabled: true, bevelThickness: 0.05, bevelSize: 0.05, bevelSegments: 2,
+  });
+  geo.translate(0, 0, -depth / 2);              // 厚度居中，转动时不偏心
+  return geo;
+}
+
 function createParticles() {
   const sphereGeo = new THREE.SphereGeometry(0.5, 32, 32);
   const boxGeo = new THREE.BoxGeometry(0.55, 0.55, 0.55);
@@ -306,12 +326,14 @@ function createParticles() {
     mainGroup.add(mesh);
     particleSystem.push(new Particle(mesh, type, false));
   }
-  const starGeo = new THREE.OctahedronGeometry(1.2, 0);
+  // 树顶：五角星（以前是八面体，正面看就是个菱形）
+  const starGeo = createStarGeometry();
   const starMat = new THREE.MeshStandardMaterial({
     color: 0xffdd88, emissive: 0xffaa00, emissiveIntensity: 1.0, metalness: 1.0, roughness: 0
   });
   const star = new THREE.Mesh(starGeo, starMat);
   star.position.set(0, CONFIG.particles.treeHeight/2 + 1.2, 0);
+  treeStar = star;
   mainGroup.add(star);
   mainGroup.add(photoMeshGroup);
 }
@@ -1289,6 +1311,12 @@ function updateSceneRotation(dt) {
   }
   mainGroup.rotation.y = STATE.rotation.y;
   mainGroup.rotation.x = STATE.rotation.x;
+
+  // 星星始终正对镜头：不然树一转，五角星就侧成一条线
+  if (treeStar) {
+    mainGroup.getWorldQuaternion(_starQuat);
+    treeStar.quaternion.copy(_starQuat.invert());
+  }
 }
 
 init();
